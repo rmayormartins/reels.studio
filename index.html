@@ -260,7 +260,7 @@ footer.bot a{color:var(--muted)}
             </select></label>
           </div>
           <label>Perfil exibido no rodapé do vídeo<input type="text" id="handle" placeholder="@seu.perfil"></label>
-          <label class="chk"><input type="checkbox" id="grounding"> Checar fatos com Google Search <span class="muted">(traz fontes)</span></label>
+          <label class="chk"><input type="checkbox" id="grounding"> Checar fatos com Google Search <span class="muted">(traz fontes; costuma exigir faturamento ativo)</span></label>
           <details>
             <summary>INSTRUÇÕES EXTRAS PARA A IA</summary>
             <textarea id="extra" rows="3" placeholder="Ex.: use um exemplo de radioamador; cite dados da NASA; evite jargão"></textarea>
@@ -1077,7 +1077,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const yieldUI = () => new Promise(r => { const ch = new MessageChannel(); ch.port1.onmessage = () => r(); ch.port2.postMessage(0); });
 const dbToLin = db => Math.pow(10, db / 20);
 const GEM = 'https://generativelanguage.googleapis.com/v1beta';
-const TEXT_FALLBACK = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash'];
+const TEXT_FALLBACK = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 const TTS_FALLBACK = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts', 'gemini-3.1-flash-tts-preview', 'gemini-2.5-flash-preview-tts'];
 const GEMINI_VOICES = [['Charon', 'informativa'], ['Kore', 'firme'], ['Puck', 'animada'], ['Fenrir', 'empolgada'], ['Orus', 'firme'], ['Iapetus', 'clara'], ['Sadaltager', 'conhecedora'], ['Rasalgethi', 'informativa'], ['Alnilam', 'firme'], ['Zephyr', 'brilhante'], ['Aoede', 'leve'], ['Leda', 'jovem'], ['Callirrhoe', 'tranquila'], ['Autonoe', 'brilhante'], ['Enceladus', 'soprosa'], ['Umbriel', 'tranquila'], ['Algieba', 'suave'], ['Despina', 'suave'], ['Erinome', 'clara'], ['Algenib', 'rouca'], ['Laomedeia', 'animada'], ['Achernar', 'macia'], ['Schedar', 'equilibrada'], ['Gacrux', 'madura'], ['Pulcherrima', 'direta'], ['Achird', 'amigável'], ['Zubenelgenubi', 'casual'], ['Vindemiatrix', 'gentil'], ['Sadachbia', 'viva'], ['Sulafat', 'calorosa']];
 
@@ -1287,28 +1287,54 @@ function bufferToWav(ab) { const ch = ab.numberOfChannels, len = ab.length, data
 // GEMINI (roteiro + TTS) e ELEVENLABS
 // =====================================================================
 function uerr(m) { const e = new Error(m); e.user = true; return e; }
-async function gfetch(path, body, method = 'POST') {
+function parseGemErr(status, j, model) {
+  const err = j?.error || {}, msg = String(err.message || ''), det = Array.isArray(err.details) ? err.details : [];
+  const ri = det.find(d => /RetryInfo/.test(d['@type'] || '') || d.retryDelay);
+  let retry = ri && ri.retryDelay ? parseFloat(ri.retryDelay) : NaN; const m = msg.match(/retry in ([\d.]+)\s*s/i); if (!isFinite(retry) && m) retry = parseFloat(m[1]);
+  const viol = det.filter(d => /QuotaFailure/.test(d['@type'] || '')).flatMap(d => d.violations || []);
+  const limitZero = /limit:\s*0\b/.test(msg) || viol.some(v => String(v.quotaValue) === '0');
+  const blob = msg + ' ' + JSON.stringify(viol);
+  const perDay = /per_?day|PerDay|_rpd|requests_per_day/i.test(blob);
+  const grounding = /search|grounding/i.test(blob);
+  const metrics = [...new Set(viol.map(v => String(v.quotaMetric || v.quotaId || '').split('/').pop().replace(/^generate_content_/, '') + (v.quotaValue != null ? ' (limite ' + v.quotaValue + ')' : '')).filter(Boolean))];
+  const short = metrics.length ? metrics.join('; ') : msg.split('\n')[0].replace(/For more information.*$/i, '').trim().slice(0, 200);
+  return { status, msg, retry, limitZero, perDay, grounding, short, model };
+}
+async function gfetch(path, body, method = 'POST', opts = {}) {
   if (!keys.gemini) throw uerr('Cole sua chave do Gemini na aba 05 CHAVES.');
+  const model = (path.match(/models\/([^:]+):/) || [])[1] || '';
   for (let attempt = 0; ; attempt++) {
     let res;
     try { res = await fetch(GEM + path, { method, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': keys.gemini }, body: body ? JSON.stringify(body) : undefined }); }
     catch (e) { throw uerr('Falha de rede ao falar com o Gemini (' + e.message + ').'); }
     if (res.ok) return res.json();
     let j = null; try { j = await res.json(); } catch {}
-    const msg = j?.error?.message || res.statusText || 'erro';
-    if ([429, 500, 503].includes(res.status) && attempt < 3) {
-      const rd = (j?.error?.details || []).find(d => d.retryDelay)?.retryDelay; const wait = rd ? Math.min(60, parseFloat(rd) + 1) : 3 * 2 ** attempt;
-      log(`Gemini ${res.status}: aguardando ${Math.round(wait)} s para tentar de novo`, 'warn'); await sleep(wait * 1000); continue;
-    }
-    const e = new Error(`Gemini ${res.status}: ${msg}`); e.status = res.status; throw e;
+    const q = parseGemErr(res.status, j, model);
+    if (res.status === 429) {
+      const transient = !q.limitZero && !q.perDay && !opts.noRetry && (!isFinite(q.retry) || q.retry <= 40);
+      if (transient && attempt < 2) { const wait = isFinite(q.retry) ? q.retry + 1 : 8 * (attempt + 1); log(`Gemini 429 (${model}): limite por minuto, aguardando ${Math.round(wait)} s`, 'warn'); await sleep(wait * 1000); continue; }
+    } else if ([500, 503].includes(res.status) && attempt < 2) { log(`Gemini ${res.status} (${model}): servidor ocupado, tentando de novo`, 'warn'); await sleep(3000 * (attempt + 1)); continue; }
+    const e = new Error(`Gemini ${res.status}${model ? ' (' + model + ')' : ''}: ${q.short || res.statusText}`); e.status = res.status; e.quota = q; e.raw = q.msg; throw e;
   }
+}
+function quotaText(q) {
+  if (!q) return '';
+  if (q.limitZero) return 'este modelo não tem cota gratuita na sua chave';
+  if (q.perDay) return 'limite diário do plano gratuito atingido (zera por volta das 4h ou 5h da manhã, horário de Brasília)';
+  return isFinite(q.retry) ? `limite por minuto, libera em ~${Math.ceil(q.retry)} s` : 'limite de uso atingido';
 }
 async function withModelFallback(kind, fn) {
   const list = kind === 'tts' ? TTS_FALLBACK : TEXT_FALLBACK, field = kind === 'tts' ? 'gTtsModel' : 'gModel';
-  let model = String(settings[field] || list[0]).replace(/^models\//, '').trim(); const tried = new Set();
+  let model = String(settings[field] || list[0]).replace(/^models\//, '').trim(); const tried = new Set(); let persist = false;
   for (;;) {
-    try { const r = await fn(model); if (settings[field] !== model) { settings[field] = model; saveSettings(); syncSettingsUI(); } return r; }
-    catch (e) { if (e.status === 404 || (e.status === 400 && /not found|not supported|unknown model|is not found/i.test(e.message))) { tried.add(model); const nx = list.find(m => !tried.has(m)); if (nx) { log(`Modelo ${model} indisponível; tentando ${nx}`, 'warn'); model = nx; continue; } } throw e; }
+    try { const r = await fn(model); if (persist && settings[field] !== model) { settings[field] = model; saveSettings(); syncSettingsUI(); } return r; }
+    catch (e) {
+      const gone = e.status === 404 || (e.status === 400 && /not found|not supported|unknown model|is not found/i.test(e.message));
+      const quota = e.status === 429;
+      if (gone || quota) { tried.add(model); const nx = list.find(m => !tried.has(m));
+        if (nx) { log(gone ? `Modelo ${model} indisponível; tentando ${nx}` : `Cota do ${model} esgotada (${quotaText(e.quota)}); tentando ${nx}`, 'warn'); if (gone) persist = true; model = nx; continue; }
+        if (quota) { const e2 = uerr(`Cota do Gemini esgotada em todos os modelos testados: ${quotaText(e.quota)}. Detalhe do Google: ${e.quota?.short || e.message}`); e2.status = 429; throw e2; } }
+      throw e; }
   }
 }
 function extractJSON(text) {
@@ -1351,29 +1377,40 @@ PALETA (campo "palette"), escolha pela categoria do tema:
 ${PALETTES.map(p => `- ${p.id}: ${p.hint}`).join('\n')}`;
 }
 async function geminiJSON(sys, user, schema, grounding) {
-  const body = { systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: {} };
-  if (grounding) { body.tools = [{ google_search: {} }]; body.contents[0].parts[0].text += `\n\nPesquise os dados no Google antes de escrever. Responda SOMENTE com um objeto JSON válido, sem markdown, neste formato:\n${schema === SCENE_SCHEMA ? JSON_SKELETON.match(/\{"tag".*?"narration":"\.\.\."\}/)[0] : JSON_SKELETON}`; }
-  else { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
+  let useG = !!grounding; const info = { groundingOff: false };
+  const makeBody = g => { const body = { systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: {} };
+    if (g) { body.tools = [{ google_search: {} }]; body.contents[0].parts[0].text += `\n\nPesquise os dados no Google antes de escrever. Responda SOMENTE com um objeto JSON válido, sem markdown, neste formato:\n${schema === SCENE_SCHEMA ? JSON_SKELETON.match(/\{"tag".*?"narration":"\.\.\."\}/)[0] : JSON_SKELETON}`; }
+    else { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
+    return body; };
   const run = async model => {
-    let j; try { j = await gfetch(`/models/${model}:generateContent`, body); }
-    catch (e) { if (e.status === 400 && body.generationConfig.responseSchema && /schema|response_schema|responseSchema/i.test(e.message)) { delete body.generationConfig.responseSchema; j = await gfetch(`/models/${model}:generateContent`, body); } else throw e; }
-    return j;
+    const path = `/models/${model}:generateContent`;
+    if (useG) {
+      try { return await gfetch(path, makeBody(true), 'POST', { noRetry: true }); }
+      catch (e) { if (!(e.status === 429 || (e.status === 400 && /search|tool|grounding/i.test(e.message)))) throw e;
+        useG = false; info.groundingOff = true;
+        log(`Google Search recusado para ${model} (${e.status === 429 ? 'sem cota para a busca nesta chave' : 'não suportado'}). No plano gratuito a busca costuma estar bloqueada nos modelos Gemini 3; gerando sem busca.`, 'warn'); }
+    }
+    const body = makeBody(false);
+    try { return await gfetch(path, body); }
+    catch (e) { if (e.status === 400 && /schema|response_schema|responseSchema/i.test(e.message)) { delete body.generationConfig.responseSchema; return await gfetch(path, body); } throw e; }
   };
   const j = await withModelFallback('text', run);
   const cand = j.candidates?.[0]; if (!cand) throw uerr('O Gemini não devolveu resposta' + (j.promptFeedback?.blockReason ? ' (bloqueio: ' + j.promptFeedback.blockReason + ')' : '') + '.');
   const text = (cand.content?.parts || []).filter(p => p.text && !p.thought).map(p => p.text).join('');
   if (!text) throw uerr('Resposta vazia do Gemini (motivo: ' + (cand.finishReason || '?') + ').');
   const sources = (cand.groundingMetadata?.groundingChunks || []).map(c => c.web).filter(Boolean).map(w => ({ title: w.title || w.uri, uri: w.uri }));
-  return { obj: extractJSON(text), sources };
+  return { obj: extractJSON(text), sources, info };
 }
 async function generateScript() {
   if (project.locked) return toast('Roteiro congelado. Destrave para gerar outro.');
+  if (!keys.gemini) return askKey();
   const topic = clean($('#topic').value); if (!topic) { $('#topic').focus(); return toast('Escreva o tema do Reels.'); }
   const n = +settings.nScenes, target = +settings.targetDur, wps = Math.round(target * 2.4 / n);
   const user = `Tema do Reels: "${topic}"\nPúblico: ${settings.audience}\nTom: ${settings.tone}\nDuração alvo: cerca de ${target} segundos no total.` + (clean($('#extra').value) ? `\nInstruções extras do autor: ${clean($('#extra').value)}` : '');
   await busy('#btnGen', 'GERANDO ROTEIRO…', async () => {
     setStatus('GEMINI ▸ ROTEIRO'); log(`Gerando roteiro: "${topic}" (${n} cenas, ~${target} s${settings.grounding ? ', com Google Search' : ''})`);
-    const { obj, sources } = await geminiJSON(systemPrompt(n, wps), user, REEL_SCHEMA, settings.grounding);
+    const { obj, sources, info } = await geminiJSON(systemPrompt(n, wps), user, REEL_SCHEMA, settings.grounding);
+    if (info.groundingOff) { settings.grounding = false; saveSettings(); syncSettingsUI(); toast('Roteiro gerado sem Google Search (bloqueado no plano gratuito).'); }
     const nr = normalizeReel({ ...obj, handle: settings.handle, sources }, reel.style);
     if (!nr.scenes.length) throw uerr('O roteiro veio sem cenas. Tente de novo.');
     nr.style.palette = PAL_IDS.includes(obj.palette) ? obj.palette : reel.style.palette; nr.style.aiPalette = nr.style.palette; nr.style.accent = null;
@@ -1449,6 +1486,7 @@ async function listElevenVoices() {
 async function generateVoices(all = false) {
   if (settings.engine === 'none') return toast('Motor de voz: sem narração.');
   if (all && !confirm('Regerar a narração de TODAS as cenas com a voz atual? Isso consome créditos de novo.')) return;
+  if (settings.engine === 'gemini' && !keys.gemini) return askKey();
   const todo = reel.scenes.map((s, i) => i).filter(i => reel.scenes[i].narration && (all || sceneAudioState(i) !== 'ok'));
   if (!todo.length) { log('Todas as cenas já têm voz. Use REGERAR TODAS para trocar a voz.', 'info'); return toast('Vozes já estão prontas.'); }
   getCtx();
@@ -1649,11 +1687,12 @@ async function busy(sel, label, fn) {
   if (b) { b.disabled = true; b.textContent = label; }
   try { await fn(); } catch (e) { handleErr(e); } finally { ui.busy = false; const b2 = $(sel); if (b2) { b2.innerHTML = old; b2.disabled = false; } applyLock(); }
 }
+function askKey() { showTab($('.tabs[data-group="L"]'), 'chaves'); const k = $('#kGemini'); k.focus(); k.closest('.card').animate([{ boxShadow: '0 0 0 2px var(--acc)' }, { boxShadow: '0 0 0 0 transparent' }], { duration: 1400 }); toast('Cole sua chave do Gemini aqui (fica salva neste navegador).'); log('Falta a chave do Gemini: cole em 05 CHAVES. Ela fica salva neste navegador.', 'warn'); }
 function handleErr(e, ctxName) {
   console.error(e); let m = e.message || String(e);
   if (/API key not valid|API_KEY_INVALID/i.test(m)) m = 'Chave do Gemini inválida. Confira em 05 CHAVES.';
   else if (/referer|referrer/i.test(m)) m = 'A chave está restrita a outro site. Libere este endereço nas restrições da chave.';
-  else if (/quota|RESOURCE_EXHAUSTED/i.test(m)) m = 'Cota da API esgotada por agora. Espere um pouco ou troque o modelo.';
+  else if (!e.user && e.status === 429) m = `Cota do Gemini esgotada (${quotaText(e.quota)}). Detalhe: ${e.quota?.short || m}`;
   log((ctxName ? ctxName + ': ' : '') + m, 'err'); setStatus('ERRO', 'err'); toast(m.length > 90 ? m.slice(0, 88) + '…' : m);
 }
 
@@ -1910,7 +1949,8 @@ function boot() {
   const all = listProjects(), cur = localStorage.getItem(LS.current), p = all.find(x => x.id === cur) || all[0];
   if (p) openProject(p); else { newProject(normalizeReel(DEFAULT_REEL())); $('#howto').open = true; }
   log(`REELS.studio v${VERSION} pronto · ${typeof VideoEncoder !== 'undefined' ? 'WebCodecs disponível (MP4 quadro a quadro)' : 'sem WebCodecs: exportação em tempo real'}`, 'ok');
-  if (!keys.gemini) log('Dica: cole sua chave do Gemini em 05 CHAVES para gerar roteiro e voz.', 'info');
+  if (!keys.gemini) log('Dica: cole sua chave do Gemini em 05 CHAVES para gerar roteiro e voz. Ela fica salva neste navegador.', 'info');
+  else log(`Chave do Gemini carregada deste navegador (${settings.remember ? 'salva' : 'só nesta aba'}), não precisa colar de novo.`, 'ok');
   ensureFonts().then(() => { ui.dirty = true; scheduleThumbs(0); });
   requestAnimationFrame(loop);
   window.__reels = { get reel() { return reel; }, settings, keys, A, ui, getTimeline, drawFrame, buildMix, seek, seekPoster, play, pause, getCaps, sceneAudioState };
