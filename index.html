@@ -116,6 +116,8 @@ details[open] summary{margin-bottom:8px}
 .seg button{flex:1;font:700 10.5px var(--mono);letter-spacing:.04em;padding:8px 4px;background:#080d12;color:var(--muted);border:none;border-right:1px solid var(--line2);cursor:pointer}
 .seg button:last-child{border-right:none}
 .seg button.on{background:color-mix(in srgb,var(--acc) 20%,#080d12);color:var(--text)}
+.sample{display:flex;flex-direction:column;gap:8px;border:1px dashed var(--line2);border-radius:7px;padding:10px;background:rgba(5,8,11,.35)}
+#btnSample.on{border-color:var(--acc);color:var(--acc);background:color-mix(in srgb,var(--acc) 12%,#101a24)}
 .lockbox{border-color:rgba(245,165,36,.25)}
 .lockbox.on{border-color:rgba(245,165,36,.6);background:linear-gradient(180deg,rgba(245,165,36,.07),transparent 60%),var(--panel2)}
 .lockbox::before{background:var(--amber)}
@@ -297,6 +299,11 @@ footer.bot a{color:var(--muted)}
             <label>Voice ID<div class="row"><input type="text" id="eVoice" spellcheck="false"><button class="btn sm" id="btnEVoices">LISTAR</button></div></label>
             <select id="eVoiceList" hidden></select>
             <label>Modelo<input type="text" id="eModel" list="dlEleven" spellcheck="false"></label>
+          </div>
+          <div id="sampleBox" class="sample">
+            <label>Frase da amostra<input type="text" id="sampleText" maxlength="220" spellcheck="false"></label>
+            <div class="row"><button class="btn" style="flex:1" id="btnSample">▶ OUVIR AMOSTRA</button><button class="btn sm" id="btnSampleScene" title="Usa a primeira frase da cena 1 como amostra">CENA 1</button></div>
+            <p class="hint">Gera um trecho curto com a voz, o estilo e o modelo escolhidos. Cada combinação nova gasta 1 chamada; repetir a mesma toca do cache, sem gastar cota.</p>
           </div>
           <label>Respiro entre cenas <span class="v" id="gapVal">0,35 s</span><input type="range" id="gap" min="0.1" max="1.2" step="0.05"></label>
           <div class="row"><button class="btn pri" style="flex:1" id="btnVoices">◉ GERAR VOZES</button><button class="btn" id="btnVoicesAll" title="Regenera todas as cenas com a voz atual">REGERAR TODAS</button></div>
@@ -1123,7 +1130,8 @@ let actx = null, previewSrc = null, previewGain = null;
 const SETTINGS_DEF = { engine: 'gemini', gVoice: 'Charon', gStyle: 'narrador de divulgação científica, confiante e animado, ritmo ágil, português do Brasil',
   gTtsModel: TTS_FALLBACK[0], eVoice: 'JBFqnCBsd6RMkjVDRZzb', eModel: 'eleven_multilingual_v2', gap: 0.35, music: 'drone', musicDb: -24, duck: true, blips: true,
   res: '1080', fps: '30', quality: '2400000', gModel: TEXT_FALLBACK[0], tone: 'curioso e direto, com ganchos e frases curtas', audience: 'público geral curioso por tecnologia',
-  nScenes: '5', targetDur: '45', grounding: false, handle: '@seu.perfil', remember: true, safeZone: true };
+  nScenes: '5', targetDur: '45', grounding: false, handle: '@seu.perfil', remember: true, safeZone: true,
+  sampleText: 'Olá! Esta é a voz que vai narrar os Reels do perfil: satélites, redes e espectro explicados em menos de um minuto.' };
 const LS = { settings: 'reels.settings.v1', keys: 'reels.keys.v1', projects: 'reels.projects.v1', current: 'reels.current.v1' };
 function lsGet(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { log('Armazenamento local cheio ou bloqueado: ' + e.message, 'err'); return false; } }
@@ -1480,7 +1488,7 @@ async function listElevenVoices() {
     if (!res.ok) throw uerr('ElevenLabs ' + res.status + ' ao listar vozes (a chave precisa da permissão voices_read).');
     const j = await res.json(), vs = (j.voices || []).map(v => ({ id: v.voice_id, name: v.name, lab: [v.labels?.gender, v.labels?.accent, v.category].filter(Boolean).join(', ') }));
     const sel = $('#eVoiceList'); sel.innerHTML = '<option value="">Escolha uma voz…</option>' + vs.map(v => `<option value="${esc(v.id)}">${esc(v.name)}${v.lab ? ' (' + esc(v.lab) + ')' : ''}</option>`).join('');
-    sel.hidden = false; log(`${vs.length} vozes da ElevenLabs listadas`, 'ok');
+    vs.forEach(v => elevenNames[v.id] = v.name); sel.hidden = false; setSampleBtn(false); log(`${vs.length} vozes da ElevenLabs listadas`, 'ok');
   });
 }
 async function generateVoices(all = false) {
@@ -1503,6 +1511,36 @@ async function generateVoices(all = false) {
     }
     setStatus('VOZES PRONTAS'); renderPills(); toast('Vozes prontas. Dê play para conferir.');
   });
+}
+
+// =====================================================================
+// AMOSTRA DE VOZ (ouvir antes de narrar o vídeo todo)
+// =====================================================================
+let sampleSrc = null;
+const elevenNames = {};
+function voiceLabel() { return settings.engine === 'eleven' ? (elevenNames[settings.eVoice] || settings.eVoice || 'ElevenLabs') : (settings.gVoice || 'Charon'); }
+function setSampleBtn(playing) { const b = $('#btnSample'); if (!b || b.disabled) return; b.classList.toggle('on', playing); b.textContent = (playing ? '■ PARAR AMOSTRA · ' : '▶ OUVIR AMOSTRA · ') + voiceLabel().toUpperCase(); }
+function stopSample() { if (sampleSrc) { try { sampleSrc.onended = null; sampleSrc.stop(); } catch {} sampleSrc = null; } setSampleBtn(false); }
+async function playSample() {
+  if (sampleSrc) return stopSample();
+  if (settings.engine === 'none') return toast('Escolha um motor de voz.');
+  if (settings.engine === 'gemini' && !keys.gemini) return askKey();
+  if (settings.engine === 'eleven' && !keys.eleven) { showTab($('.tabs[data-group="L"]'), 'chaves'); $('#kEleven').focus(); return toast('Cole a chave da ElevenLabs aqui.'); }
+  const text = cut(settings.sampleText || SETTINGS_DEF.sampleText, 220); if (!text) return toast('Escreva a frase da amostra.');
+  if (ui.playing) pause();
+  const key = voiceKey('amostra|' + text), label = voiceLabel();
+  await busy('#btnSample', 'GERANDO AMOSTRA…', async () => {
+    setStatus('VOZ ▸ AMOSTRA');
+    let rec = await IDB.get(key); const cached = !!rec;
+    if (!rec) { rec = settings.engine === 'eleven' ? await ttsEleven(text) : await ttsGemini(text); await IDB.put(key, rec); }
+    const ctx = getCtx(); try { if (ctx.state === 'suspended') await ctx.resume(); } catch {}
+    const buf = await ctx.decodeAudioData(rec.bytes.slice(0));
+    const src = ctx.createBufferSource(), g = ctx.createGain(); src.buffer = buf; g.gain.value = voiceGain(buf); src.connect(g); g.connect(ctx.destination);
+    src.onended = () => { if (sampleSrc === src) { sampleSrc = null; setSampleBtn(false); } };
+    src.start(); sampleSrc = src;
+    log(`Amostra: ${label}${settings.engine === 'gemini' ? ' · ' + settings.gTtsModel : ''} · ${ptNum(buf.duration)} s${cached ? ' (do cache, sem gastar cota)' : ''}`, 'ok'); setStatus('AMOSTRA');
+  });
+  setSampleBtn(!!sampleSrc);
 }
 
 // =====================================================================
@@ -1556,7 +1594,7 @@ async function buildMix(sr = 48000, lengthSec) {
 function curT() { if (!ui.playing) return ui.t; return ui.clock === 'audio' ? Math.max(0, actx.currentTime - ui.startAt) : performance.now() / 1000 - ui.startAt; }
 function stopSrc() { if (previewSrc) { try { previewSrc.onended = null; previewSrc.stop(); } catch {} previewSrc.disconnect(); previewSrc = null; } }
 async function play() {
-  if (ui.playing) return pause(); if (ui.exporting) return;
+  if (ui.playing) return pause(); if (ui.exporting) return; if (sampleSrc) stopSample();
   const tl = getTimeline(); if (ui.posterFrom != null) { ui.t = ui.posterFrom; ui.posterFrom = null; } if (ui.t >= tl.total - 0.05) ui.t = 0;
   const ctx = getCtx(); try { if (ctx.state === 'suspended') await ctx.resume(); } catch {}
   if (A.mixDirty || !A.mix) { setStatus('MIXANDO ÁUDIO'); try { A.mix = await buildMix(48000); } catch (e) { A.mix = null; log('Falha na mixagem: ' + e.message, 'err'); } A.mixDirty = false; setStatus('PREVIEW'); }
@@ -1831,11 +1869,11 @@ function renderProjects() {
 // ----- sincronização de controles -----
 function syncSettingsUI() {
   const set = (id, v) => { const el = $('#' + id); if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; };
-  ['ttsEngine:engine', 'gVoice', 'gStyle', 'gTtsModel', 'eVoice', 'eModel', 'gap', 'music', 'musicDb', 'duck', 'blips', 'res', 'fps', 'quality', 'gModel', 'tone', 'audience', 'nScenes', 'targetDur', 'grounding', 'handle', 'remember', 'safeZone']
+  ['ttsEngine:engine', 'gVoice', 'gStyle', 'gTtsModel', 'eVoice', 'eModel', 'gap', 'music', 'musicDb', 'duck', 'blips', 'res', 'fps', 'quality', 'gModel', 'tone', 'audience', 'nScenes', 'targetDur', 'grounding', 'handle', 'remember', 'safeZone', 'sampleText']
     .forEach(p => { const [id, k] = p.split(':'); set(id, settings[k || id]); });
   $('#gapVal').textContent = ptNum(+settings.gap, 2) + ' s'; $('#musicDbVal').textContent = settings.musicDb + ' dB';
   $('#ttsGemini').style.display = settings.engine === 'gemini' ? 'flex' : 'none'; $('#ttsEleven').style.display = settings.engine === 'eleven' ? 'flex' : 'none';
-  $('#musicFileRow').style.display = settings.music === 'file' ? 'flex' : 'none'; $('#musicName').textContent = A.musicName || 'nenhum';
+  $('#musicFileRow').style.display = settings.music === 'file' ? 'flex' : 'none'; $('#sampleBox').style.display = settings.engine === 'none' ? 'none' : 'flex'; if (!sampleSrc && !ui.busy) setSampleBtn(false); $('#musicName').textContent = A.musicName || 'nenhum';
   $('#kGemini').value = keys.gemini; $('#kEleven').value = keys.eleven;
   $('#gKeyBadge').textContent = keys.gemini ? 'SALVA' : 'SEM CHAVE'; $('#gKeyBadge').className = 'badge' + (keys.gemini ? ' ok' : '');
   $('#eKeyBadge').textContent = keys.eleven ? 'SALVA' : 'SEM CHAVE'; $('#eKeyBadge').className = 'badge' + (keys.eleven ? ' ok' : '');
@@ -1850,7 +1888,7 @@ function syncStyleUI() {
 function renderAll(scroll = true) { renderScenes(); renderPills(); renderVoiceList(); renderPalGrid(); syncStyleUI(); syncPostUI(); renderSources(); syncJson(true); applyLock(); estSize(); ui.dirty = true; if (scroll) $('#scenesList').parentElement.scrollTop = 0; }
 
 function bindSettings() {
-  const map = { ttsEngine: 'engine', gVoice: 'gVoice', gStyle: 'gStyle', gTtsModel: 'gTtsModel', eVoice: 'eVoice', eModel: 'eModel', gap: 'gap', music: 'music', musicDb: 'musicDb', duck: 'duck', blips: 'blips', res: 'res', fps: 'fps', quality: 'quality', gModel: 'gModel', tone: 'tone', audience: 'audience', nScenes: 'nScenes', targetDur: 'targetDur', grounding: 'grounding', handle: 'handle', remember: 'remember' };
+  const map = { ttsEngine: 'engine', gVoice: 'gVoice', gStyle: 'gStyle', gTtsModel: 'gTtsModel', eVoice: 'eVoice', eModel: 'eModel', gap: 'gap', music: 'music', musicDb: 'musicDb', duck: 'duck', blips: 'blips', res: 'res', fps: 'fps', quality: 'quality', gModel: 'gModel', tone: 'tone', audience: 'audience', nScenes: 'nScenes', targetDur: 'targetDur', grounding: 'grounding', handle: 'handle', remember: 'remember', sampleText: 'sampleText' };
   Object.entries(map).forEach(([id, k]) => { const el = $('#' + id); el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', () => {
     let v = el.type === 'checkbox' ? el.checked : el.value; if (k === 'gap' || k === 'musicDb') v = +v; settings[k] = v; saveSettings();
     if (k === 'gap') { invalidate(); renderPills(); updateHud(); estSize(); }
@@ -1867,7 +1905,9 @@ function bindUI() {
   $('#btnGen').onclick = generateScript;
   $('#lock').onchange = e => { project.locked = e.target.checked; applyLock(); saveProjectNow(); log(project.locked ? 'Roteiro congelado: só visual, voz pendente e exportação liberados' : 'Roteiro destravado', project.locked ? 'warn' : 'info'); };
   $('#btnVoices').onclick = () => generateVoices(false); $('#btnVoicesAll').onclick = () => generateVoices(true);
-  $('#btnEVoices').onclick = listElevenVoices; $('#eVoiceList').onchange = e => { if (!e.target.value) return; settings.eVoice = e.target.value; saveSettings(); syncSettingsUI(); };
+  $('#btnEVoices').onclick = listElevenVoices;
+  $('#btnSample').onclick = playSample;
+  $('#btnSampleScene').onclick = () => { const n = (reel.scenes[0]?.narration || '').match(/^.*?[.!?](\s|$)/); const t = cut(n ? n[0] : reel.scenes[0]?.narration || '', 220); if (!t) return toast('A cena 1 não tem narração.'); settings.sampleText = t; saveSettings(); syncSettingsUI(); toast('Frase da cena 1 carregada. Clique em OUVIR AMOSTRA.'); }; $('#eVoiceList').onchange = e => { if (!e.target.value) return; settings.eVoice = e.target.value; saveSettings(); syncSettingsUI(); };
   $('#musicFile').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { A.musicBuf = await getCtx().decodeAudioData(await f.arrayBuffer()); A.musicName = f.name; A.mixDirty = true; log(`Trilha carregada: ${f.name} (${ptNum(A.musicBuf.duration)} s)`, 'ok'); } catch (err) { handleErr(uerr('Não consegui ler esse áudio: ' + err.message)); } syncSettingsUI(); };
   // visual
   $('#palGrid').onclick = e => { const b = e.target.closest('.pal'); if (b) setPalette(b.dataset.pal); };
