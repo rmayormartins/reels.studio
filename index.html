@@ -339,6 +339,7 @@ footer.bot a{color:var(--muted)}
             <label>Textura<select id="texture"><option value="grid">Grade</option><option value="crt">Scanlines CRT</option><option value="clean">Limpa</option></select></label>
           </div>
           <label class="chk"><input type="checkbox" id="countUp"> Números das métricas com contagem animada</label>
+          <label class="chk"><input type="checkbox" id="coverFirst"> Cena 1 já montada no primeiro quadro <span class="muted">(miniatura e Stories nunca vazios)</span></label>
         </div>
         <div class="card">
           <div class="card-h"><span>Legenda sincronizada</span><label class="switch acc"><input type="checkbox" id="capOn"><span class="sl"></span></label></div>
@@ -592,17 +593,18 @@ function drawFrame(ctx, t, o = {}) {
   t = clamp(t, 0, Math.max(0, tl.total - 1e-3));
   const i = sceneAt(t, tl), sc = reel.scenes[i], lt = t - tl.starts[i], dur = tl.durs[i];
   drawChrome(ctx, P, tl, t, i);
+  const cover = i === 0 && st.coverFirst !== false, le = cover ? lt + 2.6 : lt; // cena 1 já montada no quadro 0
   ctx.save();
   ctx.globalAlpha = i === n - 1 ? 1 : clamp((dur - lt) / 0.2);
-  drawTag(ctx, P, sc, lt);
-  drawTitle(ctx, P, sc, lt, st);
-  drawFigure(ctx, P, sc, lt, i);
-  const ny = drawMetrics(ctx, P, sc, lt, st);
-  drawNotes(ctx, P, sc, lt, ny);
+  drawTag(ctx, P, sc, le);
+  drawTitle(ctx, P, sc, le, st);
+  drawFigure(ctx, P, sc, le, i);
+  const ny = drawMetrics(ctx, P, sc, le, st);
+  drawNotes(ctx, P, sc, le, ny);
   ctx.restore();
   if (st.captions.on) drawCaptions(ctx, P, i, lt, st);
   drawTexture(ctx, P, st);
-  drawWipe(ctx, P, lt);
+  if (!cover) drawWipe(ctx, P, lt);
   if (o.preview && ui.safeZone) drawSafe(ctx);
 }
 
@@ -1089,7 +1091,7 @@ const TTS_FALLBACK = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts', 'gemi
 const GEMINI_VOICES = [['Charon', 'informativa'], ['Kore', 'firme'], ['Puck', 'animada'], ['Fenrir', 'empolgada'], ['Orus', 'firme'], ['Iapetus', 'clara'], ['Sadaltager', 'conhecedora'], ['Rasalgethi', 'informativa'], ['Alnilam', 'firme'], ['Zephyr', 'brilhante'], ['Aoede', 'leve'], ['Leda', 'jovem'], ['Callirrhoe', 'tranquila'], ['Autonoe', 'brilhante'], ['Enceladus', 'soprosa'], ['Umbriel', 'tranquila'], ['Algieba', 'suave'], ['Despina', 'suave'], ['Erinome', 'clara'], ['Algenib', 'rouca'], ['Laomedeia', 'animada'], ['Achernar', 'macia'], ['Schedar', 'equilibrada'], ['Gacrux', 'madura'], ['Pulcherrima', 'direta'], ['Achird', 'amigável'], ['Zubenelgenubi', 'casual'], ['Vindemiatrix', 'gentil'], ['Sadachbia', 'viva'], ['Sulafat', 'calorosa']];
 
 // ---------- exemplo inicial ----------
-const DEFAULT_STYLE = () => ({ palette: 'telemetria', aiPalette: 'telemetria', accent: null, custom: null, font: 'mono', texture: 'grid', countUp: true,
+const DEFAULT_STYLE = () => ({ palette: 'telemetria', aiPalette: 'telemetria', accent: null, custom: null, font: 'mono', texture: 'grid', countUp: true, coverFirst: true,
   captions: { on: true, style: 'karaoke', size: 1, y: 1490, words: 4 } });
 const DEFAULT_REEL = () => ({
   slug: 'iss-architecture', title: 'Como funciona a ISS', series: 'MANUAL TÉCNICO', synopsis: 'iss-architecture [orbit|power|eclss|comms] --live', handle: '@seu.perfil',
@@ -1619,6 +1621,21 @@ async function ensureFonts() {
   try { await Promise.race([Promise.all(specs.map(s => document.fonts.load(s, 'AÉ▸0'))), sleep(4000)]); } catch {}
 }
 function estSize() { const tl = getTimeline(), vb = +settings.quality * (settings.res === '720' ? 0.55 : 1), ab = 128000; const mb = (vb + ab) * tl.total / 8 / 1e6; $('#estSize').innerHTML = `≈ <b>${ptNum(mb)} MB</b> para <b>${ptNum(tl.total)} s</b> · ${settings.res === '720' ? '720×1280' : '1080×1920'} · ${Math.round(vb / 1e5) / 10} Mbps`; }
+// Converte RGBA do canvas para YUV 4:2:0 BT.709 em faixa limitada (16-235), o mesmo padrão das câmeras de celular.
+function canMakeI420() { try { const f = new VideoFrame(new Uint8Array(16 * 16 * 3 / 2), { format: 'I420', codedWidth: 16, codedHeight: 16, timestamp: 0, colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false } }); f.close(); return true; } catch { return false; } }
+function rgbaToI420(src, w, h, out) {
+  const ySize = w * h, cw = w >> 1, ch = h >> 1, uOff = ySize, vOff = ySize + cw * ch;
+  for (let i = 0, o = 0; o < ySize; o++, i += 4) out[o] = 16 + ((47 * src[i] + 157 * src[i + 1] + 16 * src[i + 2] + 128) >> 8);
+  for (let y = 0; y < ch; y++) {
+    const r0 = 2 * y * w * 4, r1 = r0 + w * 4, row = y * cw;
+    for (let x = 0; x < cw; x++) {
+      const a = r0 + x * 8, b = r1 + x * 8;
+      const R = (src[a] + src[a + 4] + src[b] + src[b + 4] + 2) >> 2, G = (src[a + 1] + src[a + 5] + src[b + 1] + src[b + 5] + 2) >> 2, B = (src[a + 2] + src[a + 6] + src[b + 2] + src[b + 6] + 2) >> 2;
+      out[uOff + row + x] = 128 + ((-26 * R - 87 * G + 112 * B + 128) >> 8);
+      out[vOff + row + x] = 128 + ((112 * R - 102 * G - 10 * B + 128) >> 8);
+    }
+  }
+}
 function sliceBuffer(ab, t0, t1) { const sr = ab.sampleRate, a = Math.floor(t0 * sr), b = Math.min(ab.length, Math.floor(t1 * sr)), len = Math.max(1, b - a);
   const out = new AudioBuffer({ length: len, sampleRate: sr, numberOfChannels: ab.numberOfChannels }); for (let c = 0; c < ab.numberOfChannels; c++) out.copyToChannel(ab.getChannelData(c).subarray(a, a + len), c); return out; }
 function progress(f, txt) { $('#progBar').style.width = (clamp(f) * 100).toFixed(1) + '%'; if (txt) $('#progTxt').textContent = txt; }
@@ -1648,9 +1665,13 @@ async function exportVideo() {
       log('AAC nativo indisponível neste navegador; carregando codificador AAC (WASM)…', 'info');
       const ext = await import('@mediabunny/aac-encoder'); ext.registerAacEncoder();
     }
-    const cv = document.createElement('canvas'); cv.width = Wt; cv.height = Ht; const c2 = cv.getContext('2d', { alpha: false });
+    const useI420 = canMakeI420(); const BT709 = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
+    const cv = document.createElement('canvas'); cv.width = Wt; cv.height = Ht; const c2 = cv.getContext('2d', { alpha: false, willReadFrequently: useI420 });
+    const yuv = useI420 ? new Uint8Array(Wt * Ht * 3 / 2) : null;
     const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new MB.BufferTarget() });
-    const vs = new MB.CanvasSource(cv, { codec: 'avc', quality: new MB.Quality({ bitrate: vb }), keyFrameInterval: 2, latencyMode: 'quality' });
+    const vcfg = { codec: 'avc', quality: new MB.Quality({ bitrate: vb }), keyFrameInterval: 2, latencyMode: 'quality' };
+    const vs = useI420 ? new MB.VideoSampleSource(vcfg) : new MB.CanvasSource(cv, vcfg);
+    if (!useI420) log('Cor: este navegador não aceita quadros I420; exportando com a cor do canvas.', 'warn');
     output.addVideoTrack(vs, { frameRate: fps });
     let as = null; if (mix) { as = new MB.AudioBufferSource({ codec: 'aac', quality: new MB.Quality({ bitrate: 128000 }) }); output.addAudioTrack(as); }
     await output.start();
@@ -1659,13 +1680,17 @@ async function exportVideo() {
       if (ui.cancel) { await output.cancel(); throw uerr('Renderização cancelada.'); }
       const t = f / fps;
       while (as && aT < Math.min(t + 1, dur)) { const nx = Math.min(aT + 1, dur); await as.add(sliceBuffer(mix, aT, nx)); aT = nx; }
-      drawFrame(c2, t, { scale }); await vs.add(t, 1 / fps);
+      drawFrame(c2, t, { scale });
+      if (useI420) { rgbaToI420(c2.getImageData(0, 0, Wt, Ht).data, Wt, Ht, yuv);
+        const smp = new MB.VideoSample(yuv, { format: 'I420', codedWidth: Wt, codedHeight: Ht, timestamp: t, duration: 1 / fps, colorSpace: BT709 });
+        try { await vs.add(smp); } finally { smp.close(); } }
+      else await vs.add(t, 1 / fps);
       if (f % 6 === 0) { const el = (performance.now() - t0) / 1000, eta = f ? el / f * (frames - f) : 0; progress(f / frames, `quadro ${f + 1}/${frames} · ${ptNum(t)} s · faltam ~${Math.ceil(eta)} s`); setStatus(`RENDER ${Math.round(f / frames * 100)}%`); await yieldUI(); }
     }
     while (as && aT < dur - 1e-4) { const nx = Math.min(aT + 1, dur); await as.add(sliceBuffer(mix, aT, nx)); aT = nx; }
     progress(1, 'finalizando arquivo…'); await output.finalize();
     const blob = new Blob([output.target.buffer], { type: 'video/mp4' }), secs = (performance.now() - t0) / 1000;
-    showResult(blob, 'mp4', `MP4 · H.264 ${Wt}×${Ht} @ ${fps} fps · AAC 128 kbps · ${ptNum(dur)} s · renderizado em ${ptNum(secs)} s`);
+    showResult(blob, 'mp4', `MP4 · H.264 ${Wt}×${Ht} @ ${fps} fps · ${useI420 ? 'cor BT.709 padrão' : 'cor sRGB'} · AAC 128 kbps · ${ptNum(dur)} s · renderizado em ${ptNum(secs)} s`);
     progress(1, `pronto: ${ptNum(blob.size / 1e6)} MB`); log(`MP4 pronto: ${ptNum(blob.size / 1e6)} MB em ${ptNum(secs)} s`, 'ok'); setStatus('MP4 PRONTO'); toast('MP4 pronto para baixar');
   } catch (e) { handleErr(e, 'render'); progress(0, e.user ? e.message : 'erro: ' + e.message); }
   finally { ui.exporting = false; $('#btnExport').disabled = false; $('#btnCancel').hidden = true; ui.dirty = true; }
@@ -1880,7 +1905,7 @@ function syncSettingsUI() {
   $('#btnSafe').classList.toggle('off', !ui.safeZone); $('#btnMute').classList.toggle('off', ui.muted);
 }
 function syncStyleUI() {
-  const st = reel.style, c = st.captions; $('#accent').value = paletteFor(st).accent; $('#font').value = st.font; $('#texture').value = st.texture; $('#countUp').checked = st.countUp;
+  const st = reel.style, c = st.captions; $('#accent').value = paletteFor(st).accent; $('#font').value = st.font; $('#texture').value = st.texture; $('#countUp').checked = st.countUp; $('#coverFirst').checked = st.coverFirst !== false;
   $('#capOn').checked = c.on; $$('#capStyle button').forEach(b => b.classList.toggle('on', b.dataset.v === c.style));
   $('#capSize').value = c.size; $('#capSizeVal').textContent = Math.round(c.size * 100) + '%'; $('#capY').value = c.y; $('#capYVal').textContent = c.y + ' px'; $('#capWords').value = c.words; $('#capWordsVal').textContent = c.words;
   $$('#palGrid .pal').forEach(b => b.classList.toggle('on', b.dataset.pal === st.palette));
@@ -1918,6 +1943,7 @@ function bindUI() {
   $('#font').onchange = e => { reel.style.font = e.target.value; afterStyle(); };
   $('#texture').onchange = e => { reel.style.texture = e.target.value; afterStyle(); };
   $('#countUp').onchange = e => { reel.style.countUp = e.target.checked; afterStyle(); };
+  $('#coverFirst').onchange = e => { reel.style.coverFirst = e.target.checked; afterStyle(); };
   $('#capOn').onchange = e => { reel.style.captions.on = e.target.checked; afterStyle(); };
   $('#capStyle').onclick = e => { const b = e.target.closest('button'); if (!b) return; reel.style.captions.style = b.dataset.v; afterStyle(); };
   $('#capSize').oninput = e => { reel.style.captions.size = +e.target.value; afterStyle(); };
